@@ -27,7 +27,13 @@ postas, vencidas = 0, 0
 canais = {c['name']: c['id'] for c in slack('conversations.list', types='public_channel', limit=200).get('channels', [])}
 for t in gql('{ teams { nodes { id name } } }')['teams']['nodes']:
     cy = sorted((dia(c['startsAt']), dia(c['endsAt']), c['id']) for c in gql('query($id:String!){ team(id:$id){ cycles(first:50){ nodes { id startsAt endsAt } } } }', {'id': t['id']})['team']['cycles']['nodes'])
-    abertas = gql('query($id:ID){ issues(first:250, filter:{team:{id:{eq:$id}}, state:{type:{nin:["completed","canceled"]}}, dueDate:{null:false}}){ nodes { id dueDate cycle { id } labels { nodes { name } } title url } } }', {'id': t['id']})['issues']['nodes']
+    abertas, cursor = [], None
+    while True:
+        r = gql('query($id:ID,$c:String){ issues(first:100, after:$c, filter:{team:{id:{eq:$id}}, state:{type:{nin:["completed","canceled"]}}, dueDate:{null:false}}){ nodes { id dueDate cycle { id } labels { nodes { name } } title url } pageInfo { hasNextPage endCursor } } }', {'id': t['id'], 'c': cursor})['issues']
+        abertas += r['nodes']
+        if not r['pageInfo']['hasNextPage']:
+            break
+        cursor = r['pageInfo']['endCursor']
     venc = []
     for i in abertas:
         p = date.fromisoformat(i['dueDate'])
