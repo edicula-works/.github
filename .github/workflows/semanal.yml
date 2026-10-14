@@ -1,0 +1,16 @@
+name: Linear semanal
+on:
+  schedule:
+    - cron: '0 11 * * 1'   # segunda, 8h em Brasília
+  workflow_dispatch:
+permissions: {}
+jobs:
+  semanal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/semanal.py
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
