@@ -1,17 +1,32 @@
 """Job semanal: põe no ciclo as issues com prazo ainda sem ciclo, avisa pendências externas vencidas
 e publica no #proj- de cada time o relatório de tempo da semana (issues entregues e agents).
 
-Lê LINEAR_API_KEY e SLACK_BOT_TOKEN do ambiente. Imprime só contagens (o log é público).
+Lê LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET (app "Edicula Agents", preferido) ou LINEAR_API_KEY, e SLACK_BOT_TOKEN. Imprime só contagens (o log é público).
 """
-import json, os, re, unicodedata, urllib.request
+import json, os, re, unicodedata, urllib.parse, urllib.request
 from datetime import date, datetime
 
 def post(url, corpo, auth):
     req = urllib.request.Request(url, data=json.dumps(corpo).encode(), headers={'Content-Type': 'application/json; charset=utf-8', 'Authorization': auth})
     return json.load(urllib.request.urlopen(req, timeout=60))
 
+_auth = None
+
+def linear_auth():
+    # App do Linear por client credentials (token novo a cada execução); senão, a chave pessoal.
+    global _auth
+    if _auth is None:
+        if os.environ.get('LINEAR_CLIENT_ID') and os.environ.get('LINEAR_CLIENT_SECRET'):
+            corpo = urllib.parse.urlencode({'grant_type': 'client_credentials', 'client_id': os.environ['LINEAR_CLIENT_ID'],
+                                            'client_secret': os.environ['LINEAR_CLIENT_SECRET'], 'scope': 'read,write'}).encode()
+            req = urllib.request.Request('https://api.linear.app/oauth/token', data=corpo, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+            _auth = 'Bearer ' + json.load(urllib.request.urlopen(req, timeout=60))['access_token']
+        else:
+            _auth = os.environ['LINEAR_API_KEY']
+    return _auth
+
 def gql(q, v=None):
-    d = post('https://api.linear.app/graphql', {'query': q, 'variables': v or {}}, os.environ['LINEAR_API_KEY'])
+    d = post('https://api.linear.app/graphql', {'query': q, 'variables': v or {}}, linear_auth())
     if d.get('errors'): raise SystemExit('erro na API do Linear')
     return d['data']
 
