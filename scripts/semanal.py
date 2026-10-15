@@ -1,7 +1,9 @@
-"""Job semanal: põe no ciclo as issues com prazo ainda sem ciclo, avisa pendências externas vencidas
-e publica no #proj- de cada time o relatório de tempo da semana (issues entregues e agents).
+"""Job semanal: põe no ciclo as issues pela semana nominal do título (N-W##-…/Gate W##-ENC;
+times sem plano usam o prazo), avisa pendências externas vencidas e publica o relatório da
+semana como comentário no gate de encerramento (Gate W##-ENC) de cada time.
 
-Lê LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET (app "Edicula Agents", preferido) ou LINEAR_API_KEY, e SLACK_BOT_TOKEN. Imprime só contagens (o log é público).
+Lê LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET (app "Edicula Agents", preferido) ou LINEAR_API_KEY.
+Imprime só contagens (o log é público). SECO=1 imprime o que faria sem mutar nada.
 """
 import json, os, re, unicodedata, urllib.parse, urllib.request
 from datetime import date, datetime
@@ -13,12 +15,11 @@ def post(url, corpo, auth):
 _auth = None
 
 def linear_auth():
-    # App do Linear por client credentials (token novo a cada execução); senão, a chave pessoal.
     global _auth
     if _auth is None:
         if os.environ.get('LINEAR_CLIENT_ID') and os.environ.get('LINEAR_CLIENT_SECRET'):
             corpo = urllib.parse.urlencode({'grant_type': 'client_credentials', 'client_id': os.environ['LINEAR_CLIENT_ID'],
-                                            'client_secret': os.environ['LINEAR_CLIENT_SECRET'], 'scope': 'read,write'}).encode()
+                'client_secret': os.environ['LINEAR_CLIENT_SECRET'], 'scope': 'read,write'}).encode()
             req = urllib.request.Request('https://api.linear.app/oauth/token', data=corpo, headers={'Content-Type': 'application/x-www-form-urlencoded'})
             _auth = 'Bearer ' + json.load(urllib.request.urlopen(req, timeout=60))['access_token']
         else:
@@ -30,18 +31,13 @@ def gql(q, v=None):
     if d.get('errors'): raise SystemExit('erro na API do Linear')
     return d['data']
 
-def slack(metodo, **kw):
-    return post('https://slack.com/api/' + metodo, kw, 'Bearer ' + os.environ['SLACK_BOT_TOKEN'])
-
-def slug(t):
-    t = unicodedata.normalize('NFKD', t).encode('ascii', 'ignore').decode().lower()
-    return re.sub(r'[^a-z0-9]+', '-', t).strip('-')
-
 dia = lambda s: datetime.fromisoformat(s.replace('Z', '+00:00')).date()
 quando = lambda s: datetime.fromisoformat(s.replace('Z', '+00:00'))
-SECO = os.environ.get('SECO') == '1'  # teste: imprime em vez de postar
+SECO = os.environ.get('SECO') == '1'
 AGENT = re.compile(r'\*\*Agent (\w+)\*\* iniciado')
 NOMES = {'preparar': 'preparações', 'revisar': 'revisões de PR', 'plano': 'revisões de plano'}
+SEMANA = re.compile(r'(?:^|\s)N-W(\d+)-')
+GATE_ENC = re.compile(r'Gate W(\d+)-ENC')
 
 def dias(h):
     return f'{h / 24:.1f} d'.replace('.', ',') if h >= 24 else f'{h:.0f} h'
@@ -54,10 +50,8 @@ def relatorio(t, desde):
         if not r['pageInfo']['hasNextPage']:
             break
         cursor = r['pageInfo']['endCursor']
-    # Issues vindas do Hub têm início/entrega da importação: contam no total, não no tempo.
     proprias = [i for i in entregues if not any(l['name'] == 'Origem: Hub' for l in i['labels']['nodes'])]
     tempos = [(i, (quando(i['completedAt']) - quando(i['startedAt'])).total_seconds() / 3600) for i in proprias if i.get('startedAt')]
-    # Agents: comentários "Agent X iniciado" da semana e o tempo até a publicação seguinte do agent.
     agentes, duracoes = {}, []
     r = gql('query($id:ID,$d:DateTimeOrDuration){ issues(first:100, filter:{team:{id:{eq:$id}}, updatedAt:{gte:$d}}){ nodes { comments(first:50, filter:{createdAt:{gte:$d}}){ nodes { body createdAt } } } } }', {'id': t['id'], 'd': desde})['issues']['nodes']
     for i in r:
@@ -73,7 +67,7 @@ def relatorio(t, desde):
     if not entregues and not agentes:
         return None
     hub = len(entregues) - len(proprias)
-    linhas = [f':bar_chart: *Semana em {t["name"]}*: {len(entregues)} issue(s) entregue(s)' + (f' ({hub} vinda(s) do Hub)' if hub else '') + (f' · ciclo médio {dias(sum(h for _, h in tempos) / len(tempos))}' if tempos else '')]
+    linhas = [f'📊 **Semana em {t["name"]}**: {len(entregues)} issue(s) entregue(s)' + (f' ({hub} vinda(s) do Hub)' if hub else '') + (f' · ciclo médio {dias(sum(h for _, h in tempos) / len(tempos))}' if tempos else '')]
     pessoas = {}
     for i, h in tempos:
         a = i['assignee'] or {}
@@ -86,40 +80,59 @@ def relatorio(t, desde):
     if agentes:
         linhas.append('• Agents: ' + ', '.join(f'{q} {NOMES.get(k, k)}' for k, q in agentes.items()) + (f' · {sum(duracoes) / len(duracoes):.0f} min em média' if duracoes else ''))
     for i, h in sorted(tempos, key=lambda x: -x[1])[:10]:
-        linhas.append(f'• <{i["url"]}|{i["identifier"]}> {i["title"][:70]} ({dias(h)})')
+        linhas.append(f'• {i["identifier"]} {i["title"][:70]} ({dias(h)})')
     return '\n'.join(linhas)
+
 hoje = date.today()
-postas, vencidas, relatorios = 0, 0, 0
-canais = {c['name']: c['id'] for c in slack('conversations.list', types='public_channel', limit=200).get('channels', [])}
+postas, realocadas, vencidas, relatorios = 0, 0, 0, 0
 for t in gql('{ teams { nodes { id name } } }')['teams']['nodes']:
-    cy = sorted((dia(c['startsAt']), dia(c['endsAt']), c['id']) for c in gql('query($id:String!){ team(id:$id){ cycles(first:50){ nodes { id startsAt endsAt } } } }', {'id': t['id']})['team']['cycles']['nodes'])
+    nos = gql('query($id:String!){ team(id:$id){ cycles(first:50){ nodes { id name startsAt endsAt } } } }', {'id': t['id']})['team']['cycles']['nodes']
+    por_nome = {c['name']: c['id'] for c in nos}
+    nome_de = {c['id']: c['name'] for c in nos}
+    fechados = sorted((c for c in nos if dia(c['endsAt']) <= hoje), key=lambda c: dia(c['endsAt']))
     abertas, cursor = [], None
     while True:
-        r = gql('query($id:ID,$c:String){ issues(first:100, after:$c, filter:{team:{id:{eq:$id}}, state:{type:{nin:["completed","canceled"]}}, dueDate:{null:false}}){ nodes { id dueDate cycle { id } labels { nodes { name } } title url } pageInfo { hasNextPage endCursor } } }', {'id': t['id'], 'c': cursor})['issues']
+        r = gql('query($id:ID,$c:String){ issues(first:100, after:$c, filter:{team:{id:{eq:$id}}, state:{type:{nin:["completed","canceled"]}}}){ nodes { id identifier title dueDate cycle { id name } labels { nodes { name } } } pageInfo { hasNextPage endCursor } } }', {'id': t['id'], 'c': cursor})['issues']
         abertas += r['nodes']
         if not r['pageInfo']['hasNextPage']:
             break
         cursor = r['pageInfo']['endCursor']
     venc = []
     for i in abertas:
-        p = date.fromisoformat(i['dueDate'])
-        if not i['cycle'] and cy:
-            alvo = cy[0] if p < cy[0][0] else next((c for c in cy if c[0] <= p < c[1]), None)
-            if alvo and not SECO:
-                gql('mutation($id:String!,$i:IssueUpdateInput!){ issueUpdate(id:$id,input:$i){ success } }', {'id': i['id'], 'i': {'cycleId': alvo[2]}})
+        m = SEMANA.search(i['title']) or GATE_ENC.search(i['title'])
+        alvo = None
+        if m:
+            alvo = por_nome.get(f'W{int(m.group(1)):02d}')
+        elif i['dueDate'] and not i['cycle'] and nos:
+            p = date.fromisoformat(i['dueDate'])
+            alvo = next((c['id'] for c in sorted(nos, key=lambda c: dia(c['startsAt'])) if dia(c['startsAt']) <= p < dia(c['endsAt'])), None)
+        if alvo and (not i['cycle'] or i['cycle']['id'] != alvo):
+            if SECO:
+                print(f'(seco) {i["identifier"]}: {(i["cycle"] or {}).get("name") or "sem ciclo"} → {nome_de.get(alvo, alvo)} · {i["title"][:50]}')
+            else:
+                gql('mutation($id:String!,$c:String!){ issueUpdate(id:$id, input:{cycleId:$c}){ success } }', {'id': i['id'], 'c': alvo})
+            if i['cycle']:
+                realocadas += 1
+            else:
                 postas += 1
-        if p < hoje and any(l['name'] == 'Pendência externa' for l in i['labels']['nodes']):
+        if i['dueDate'] and date.fromisoformat(i['dueDate']) < hoje and any(l['name'] == 'Pendência externa' for l in i['labels']['nodes']):
             venc.append(i)
-    canal = canais.get('proj-' + slug(t['name']))
-    if venc and canal and not SECO:
-        linhas = [f':warning: *{len(venc)} pendência(s) externa(s) vencida(s) em {t["name"]}*'] + [f'• <{i["url"]}|{i["title"]}> (prazo {i["dueDate"]})' for i in venc[:20]]
-        slack('chat.postMessage', channel=canal, text='\n'.join(linhas))
-        vencidas += len(venc)
+    # relatório + pendências no gate da semana que fechou
     texto = relatorio(t, (datetime.now().astimezone() - __import__('datetime').timedelta(days=7)).isoformat())
-    if texto and canal:
-        if SECO:
-            print(f'--- {t["name"]}\n{texto}')
-        else:
-            slack('chat.postMessage', channel=canal, text=texto, unfurl_links=False)
+    vencidas += len(venc)
+    if venc:
+        aviso = '\n'.join(['⚠️ **Pendência(s) externa(s) vencida(s)**'] + [f'• {i["identifier"]} {i["title"][:80]} (prazo {i["dueDate"]})' for i in venc[:20]])
+        texto = (texto + '\n\n' + aviso) if texto else aviso
+    if texto and fechados:
+        semana = fechados[-1]['name']
+        gate = gql('query($id:ID,$t:String!){ issues(first:1, filter:{team:{id:{eq:$id}}, title:{contains:$t}}){ nodes { id identifier } } }', {'id': t['id'], 't': f'Gate {semana}-ENC'})['issues']['nodes']
+        if gate:
+            corpo = f'{texto}\n\n_(job semanal, {hoje.isoformat()})_'
+            if SECO:
+                print(f'--- {t["name"]} → comentário em {gate[0]["identifier"]}\n{corpo}')
+            else:
+                gql('mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id, body:$b}){ success } }', {'id': gate[0]['id'], 'b': corpo})
             relatorios += 1
-print(f'issues colocadas em ciclo: {postas}; pendências vencidas avisadas: {vencidas}; relatórios: {relatorios}')
+        else:
+            print(f'sem gate {semana}-ENC em {t["name"]}: relatório não publicado')
+print(f'issues postas em ciclo: {postas}; realocadas p/ semana nominal: {realocadas}; pendências vencidas: {vencidas}; relatórios: {relatorios}')
